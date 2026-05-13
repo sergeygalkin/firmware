@@ -79,7 +79,7 @@ RTC_DATA_ATTR int bootCount = 0;
  */
 void setCPUFast(bool on)
 {
-#if defined(ARCH_ESP32) && HAS_WIFI && !HAS_TFT
+#if defined(ARCH_ESP32) && HAS_WIFI && !HAS_TFT && !defined(T_LORA_PAGER) && !defined(T_DECK)
 
     if (isWifiAvailable()) {
         /*
@@ -163,13 +163,6 @@ void initDeepSleep()
     if (wakeCause != ESP_SLEEP_WAKEUP_UNDEFINED) {
         LOG_DEBUG("Disable any holds on RTC IO pads");
         for (uint8_t i = 0; i <= GPIO_NUM_MAX; i++) {
-#if defined(USE_GC1109_PA)
-            // Skip GC1109 FEM power pins - they are held HIGH during deep sleep to keep
-            // the LNA active for RX wake. Released later in SX126xInterface::init() after
-            // GPIO registers are set HIGH first, avoiding a power glitch.
-            if (i == LORA_PA_POWER || i == LORA_PA_EN)
-                continue;
-#endif
             if (rtc_gpio_is_valid_gpio((gpio_num_t)i))
                 rtc_gpio_hold_dis((gpio_num_t)i);
 
@@ -323,9 +316,14 @@ void doDeepSleep(uint32_t msecToWake, bool skipPreflight = false, bool skipSaveN
 
 #ifdef HAS_PPM
     if (PPM) {
-        LOG_INFO("PMM shutdown");
-        console->flush();
-        PPM->shutdown();
+        // BQ25896 PMIC shutdown is a hard power-off state.
+        // Only use it for "sleep forever" / explicit shutdown, because timed deep sleep
+        // must remain wakeable by RTC timer.
+        if (msecToWake == portMAX_DELAY) {
+            LOG_INFO("PPM shutdown");
+            console->flush();
+            PPM->shutdown();
+        }
     }
 #endif
 
@@ -432,12 +430,21 @@ esp_sleep_wakeup_cause_t doLightSleep(uint64_t sleepMsec) // FIXME, use a more r
 #ifdef KB_INT
     gpio_wakeup_enable((gpio_num_t)KB_INT, GPIO_INTR_LOW_LEVEL);
 #endif
+#ifdef BOARD_PCA9535_INT
+    // Side-key interrupt line from PCA9535 expander (active low).
+    gpio_wakeup_enable((gpio_num_t)BOARD_PCA9535_INT, GPIO_INTR_LOW_LEVEL);
+#endif
 #ifdef BUTTON_PIN
     gpio_num_t pin = (gpio_num_t)(config.device.button_gpio ? config.device.button_gpio : BUTTON_PIN);
     gpio_wakeup_enable(pin, GPIO_INTR_LOW_LEVEL);
 #endif
-#ifdef INPUTDRIVER_ENCODER_BTN
-    gpio_wakeup_enable((gpio_num_t)INPUTDRIVER_ENCODER_BTN, GPIO_INTR_LOW_LEVEL);
+#if defined(INPUTDRIVER_TWO_WAY_ROCKER_BTN) || defined(INPUTDRIVER_ENCODER_BTN)
+#if defined(INPUTDRIVER_TWO_WAY_ROCKER_BTN)
+#define INPUTDRIVER_WAKE_BTN_PIN INPUTDRIVER_TWO_WAY_ROCKER_BTN
+#else
+#define INPUTDRIVER_WAKE_BTN_PIN INPUTDRIVER_ENCODER_BTN
+#endif
+    gpio_wakeup_enable((gpio_num_t)INPUTDRIVER_WAKE_BTN_PIN, GPIO_INTR_LOW_LEVEL);
 #endif
 #if defined(WAKE_ON_TOUCH)
     gpio_wakeup_enable((gpio_num_t)SCREEN_TOUCH_INT, GPIO_INTR_LOW_LEVEL);
@@ -474,12 +481,16 @@ esp_sleep_wakeup_cause_t doLightSleep(uint64_t sleepMsec) // FIXME, use a more r
 #ifdef KB_INT
     gpio_wakeup_disable((gpio_num_t)KB_INT);
 #endif
+#ifdef BOARD_PCA9535_INT
+    gpio_wakeup_disable((gpio_num_t)BOARD_PCA9535_INT);
+#endif
 #ifdef BUTTON_PIN
     // Disable wake-on-button interrupt. Re-attach normal button-interrupts
     gpio_wakeup_disable(pin);
 #endif
-#if defined(INPUTDRIVER_ENCODER_BTN)
-    gpio_wakeup_disable((gpio_num_t)INPUTDRIVER_ENCODER_BTN);
+#ifdef INPUTDRIVER_WAKE_BTN_PIN
+    gpio_wakeup_disable((gpio_num_t)INPUTDRIVER_WAKE_BTN_PIN);
+#undef INPUTDRIVER_WAKE_BTN_PIN
 #endif
 #if defined(WAKE_ON_TOUCH)
     gpio_wakeup_disable((gpio_num_t)SCREEN_TOUCH_INT);
@@ -498,13 +509,12 @@ esp_sleep_wakeup_cause_t doLightSleep(uint64_t sleepMsec) // FIXME, use a more r
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     notifyLightSleepEnd.notifyObservers(cause); // Button interrupts are reattached here
 
-#ifdef BUTTON_PIN
     if (cause == ESP_SLEEP_WAKEUP_GPIO) {
-        LOG_INFO("Exit light sleep gpio: btn=%d",
-                 !digitalRead(config.device.button_gpio ? config.device.button_gpio : BUTTON_PIN));
-    } else
-#endif
-    {
+        LOG_INFO("Exit light sleep gpio");
+        // If we woke because of a GPIO, it's possible power needs to run to handle.
+        power->setIntervalFromNow(0);
+        runASAP = true;
+    } else {
         LOG_INFO("Exit light sleep cause: %d", cause);
     }
 
@@ -546,7 +556,8 @@ void enableModemSleep()
 
 bool shouldLoraWake(uint32_t msecToWake)
 {
-    return msecToWake < portMAX_DELAY && (config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER);
+    return msecToWake < portMAX_DELAY && (config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER ||
+                                          config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE);
 }
 
 void enableLoraInterrupt()
@@ -567,15 +578,8 @@ void enableLoraInterrupt()
     gpio_pullup_en((gpio_num_t)LORA_CS);
 #endif
 
-#if defined(USE_GC1109_PA)
-    // Keep GC1109 FEM powered during deep sleep so LNA remains active for RX wake.
-    // Set PA_POWER and PA_EN HIGH (overrides SX126xInterface::sleep() shutdown),
-    // then latch with RTC hold so the state survives deep sleep.
-    digitalWrite(LORA_PA_POWER, HIGH);
-    rtc_gpio_hold_en((gpio_num_t)LORA_PA_POWER);
-    digitalWrite(LORA_PA_EN, HIGH);
-    rtc_gpio_hold_en((gpio_num_t)LORA_PA_EN);
-    gpio_pulldown_en((gpio_num_t)LORA_PA_TX_EN);
+#if HAS_LORA_FEM
+    loraFEMInterface.setRxModeEnableWhenMCUSleep();
 #endif
 
     LOG_INFO("setup LORA_DIO1 (GPIO%02d) with wakeup by gpio interrupt", LORA_DIO1);
